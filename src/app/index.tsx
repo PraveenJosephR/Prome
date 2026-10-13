@@ -5,6 +5,7 @@ import {
   FlatList,
   Modal,
   PanResponder,
+  Platform,
   StatusBar,
   StyleSheet,
   Text,
@@ -25,6 +26,7 @@ type Birthday = {
   id: string;
   name: string;
   date: string;
+  notificationId?: string;
 };
 
 const C = {
@@ -87,8 +89,12 @@ export default function Index() {
   });
 
   const [birthdays, setBirthdays] = useState<Birthday[]>([]);
+  const [birthdayToRemove, setBirthdayToRemove] = useState<Birthday | null>(
+    null,
+  );
   const [drawer, setDrawer] = useState(false);
   const [name, setName] = useState('');
+  const [isSavingBirthday, setIsSavingBirthday] = useState(false);
   const [date, setDate] = useState(() => {
     const today = new Date();
     return new Date(2000, today.getMonth(), today.getDate());
@@ -124,34 +130,168 @@ export default function Index() {
     .filter((b) => keyOf(b.date) < today)
     .sort((a, b) => keyOf(b.date) - keyOf(a.date));
 
-  const addBirthday = () => {
+  const addBirthday = async () => {
     if (!name.trim()) {
       Alert.alert('Name required', 'Please enter a name.');
       return;
     }
 
-    setBirthdays((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-${Math.random()}`,
-        name: name.trim(),
-        date: toISO(date),
-      },
-    ]);
+    if (isSavingBirthday) return;
+
+    setIsSavingBirthday(true);
+    const birthday: Birthday = {
+      id: `${Date.now()}-${Math.random()}`,
+      name: name.trim(),
+      date: toISO(date),
+    };
+
+    let reminderWarning: string | null = null;
+    try {
+      if (Platform.OS === 'web') {
+        reminderWarning =
+          'Birthday notifications are supported on Android and iOS.';
+      } else {
+        const Notifications = await import('expo-notifications');
+
+        if (Platform.OS === 'android') {
+          await Notifications.setNotificationChannelAsync(
+            'birthday-reminders',
+            {
+              name: 'Birthday reminders',
+              importance: Notifications.AndroidImportance.HIGH,
+            },
+          );
+        }
+
+        const currentPermission = await Notifications.getPermissionsAsync();
+        const permission =
+          currentPermission.status === 'granted'
+            ? currentPermission
+            : await Notifications.requestPermissionsAsync();
+
+        if (permission.status !== 'granted') {
+          reminderWarning =
+            'Allow notifications in your device settings to receive birthday reminders.';
+        } else {
+          const birthdayDate = fromISO(birthday.date);
+          birthday.notificationId =
+            await Notifications.scheduleNotificationAsync({
+              content: {
+                title: `It's ${birthday.name}'s birthday!`,
+                body: `Wish ${birthday.name} a happy birthday today.`,
+              },
+              trigger: {
+                type: Notifications.SchedulableTriggerInputTypes.YEARLY,
+                month: birthdayDate.getMonth(),
+                day: birthdayDate.getDate(),
+                hour: 10,
+                minute: 0,
+                ...(Platform.OS === 'android'
+                  ? { channelId: 'birthday-reminders' }
+                  : {}),
+              },
+            });
+        }
+      }
+    } catch (error) {
+      reminderWarning = `The reminder could not be scheduled. ${
+        error instanceof Error ? error.message : 'An unknown error occurred.'
+      }`;
+    }
+
+    setBirthdays((prev) => [...prev, birthday]);
     setDrawer(false);
     setName('');
+    setIsSavingBirthday(false);
+
+    if (reminderWarning) {
+      Alert.alert('Birthday saved without a reminder', reminderWarning);
+    }
   };
 
   const removeBirthday = (b: Birthday) => {
-    Alert.alert('Remove birthday?', `Remove ${b.name}'s birthday?`, [
-      { text: 'No', style: 'cancel' },
-      {
-        text: 'Yes, remove',
-        style: 'destructive',
-        onPress: () =>
-          setBirthdays((prev) => prev.filter((item) => item.id !== b.id)),
-      },
-    ]);
+    setBirthdayToRemove(b);
+  };
+
+  const confirmRemoveBirthday = async () => {
+    if (!birthdayToRemove) return;
+
+    const birthday = birthdayToRemove;
+    setBirthdayToRemove(null);
+    setBirthdays((prev) => prev.filter((item) => item.id !== birthday.id));
+
+    if (birthday.notificationId) {
+      try {
+        const Notifications = await import('expo-notifications');
+        await Notifications.cancelScheduledNotificationAsync(
+          birthday.notificationId,
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'An unknown error occurred.';
+        Alert.alert(
+          'Birthday removed',
+          `Its reminder could not be canceled and may still appear. ${message}`,
+        );
+      }
+    }
+  };
+
+  const exportBirthdays = async () => {
+    if (birthdays.length === 0) {
+      Alert.alert('No birthdays to export', 'Add a birthday before exporting.');
+      return;
+    }
+
+    if (Platform.OS === 'web') {
+      Alert.alert(
+        'Export unavailable',
+        'TXT file sharing is available in the Android and iOS app.',
+      );
+      return;
+    }
+
+    try {
+      const [Sharing, { File, Paths }] = await Promise.all([
+        import('expo-sharing'),
+        import('expo-file-system'),
+      ]);
+
+      if (!(await Sharing.isAvailableAsync())) {
+        Alert.alert('Sharing unavailable', 'This device cannot share files.');
+        return;
+      }
+
+      const lines = birthdays
+        .slice()
+        .sort((a, b) => keyOf(a.date) - keyOf(b.date))
+        .map((birthday) => `${birthday.name} - ${formatDate(birthday.date)}`);
+      const content = [
+        'Prome birthday backup',
+        `Exported ${new Date().toLocaleDateString()}`,
+        '',
+        ...lines,
+        '',
+      ].join('\n');
+      const file = new File(
+        Paths.cache,
+        `prome-birthday-backup-${toISO(new Date())}.txt`,
+      );
+      file.create({ overwrite: true });
+      file.write(content);
+
+      await Sharing.shareAsync(file.uri, {
+        mimeType: 'text/plain',
+        UTI: 'public.plain-text',
+        dialogTitle: 'Share birthday backup',
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'An unknown error occurred.';
+      Alert.alert('Export failed', `The backup could not be shared. ${message}`);
+    }
   };
 
   const changeMonth = (offset: number) => {
@@ -170,7 +310,7 @@ export default function Index() {
 
       {data.length === 0 ? (
         <Text style={styles.empty}>
-          {title === 'Upcoming'
+          {title === 'upcoming'
             ? 'No upcoming birthdays'
             : 'No completed birthdays'}
         </Text>
@@ -213,6 +353,15 @@ export default function Index() {
 
       <View style={styles.header}>
         <Text style={styles.title}>birthdays.</Text>
+        <TouchableOpacity
+          style={styles.exportButton}
+          onPress={exportBirthdays}
+          accessibilityRole="button"
+          accessibilityLabel="Export birthday backup"
+        >
+          <Ionicons name="share-outline" size={21} color={C.red} />
+          <Text style={styles.exportText}>Export</Text>
+        </TouchableOpacity>
       </View>
 
       <FlatList
@@ -221,8 +370,8 @@ export default function Index() {
         contentContainerStyle={styles.content}
         renderItem={() => (
           <>
-            {renderSection('Upcoming', upcoming)}
-            {renderSection('Completed', completed)}
+            {renderSection('upcoming', upcoming)}
+            {renderSection('completed', completed)}
           </>
         )}
       />
@@ -348,8 +497,14 @@ export default function Index() {
               })}
             </View>
 
-            <TouchableOpacity style={styles.saveButton} onPress={addBirthday}>
-              <Text style={styles.saveText}>Save birthday</Text>
+            <TouchableOpacity
+              style={[styles.saveButton, isSavingBirthday && styles.disabled]}
+              onPress={addBirthday}
+              disabled={isSavingBirthday}
+            >
+              <Text style={styles.saveText}>
+                {isSavingBirthday ? 'Saving...' : 'Save birthday'}
+              </Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -358,6 +513,42 @@ export default function Index() {
             >
               <Text style={styles.cancelText}>Cancel</Text>
             </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={birthdayToRemove !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setBirthdayToRemove(null)}
+      >
+        <View style={styles.confirmationOverlay}>
+          <TouchableOpacity
+            style={styles.confirmationBackdrop}
+            activeOpacity={1}
+            onPress={() => setBirthdayToRemove(null)}
+            accessibilityLabel="Cancel removal"
+          />
+          <View style={styles.confirmationCard}>
+            <Text style={styles.confirmationTitle}>Remove birthday?</Text>
+            <Text style={styles.confirmationMessage}>
+              Remove {birthdayToRemove?.name}&apos;s birthday?
+            </Text>
+            <View style={styles.confirmationActions}>
+              <TouchableOpacity
+                style={styles.keepButton}
+                onPress={() => setBirthdayToRemove(null)}
+              >
+                <Text style={styles.keepText}>Keep</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.removeButton}
+                onPress={confirmRemoveBirthday}
+              >
+                <Text style={styles.removeText}>Remove</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
       </Modal>
@@ -372,6 +563,7 @@ const styles = StyleSheet.create({
   },
   header: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 22,
     paddingVertical: 18,
@@ -379,6 +571,21 @@ const styles = StyleSheet.create({
   title: {
     fontFamily: F.bold,
     fontSize: 28,
+    color: C.red,
+  },
+  exportButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderWidth: 1,
+    borderColor: C.orange,
+    borderRadius: 12,
+  },
+  exportText: {
+    fontFamily: F.medium,
+    fontSize: 13,
     color: C.red,
   },
   content: {
@@ -563,6 +770,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  disabled: {
+    opacity: 0.6,
+  },
   saveText: {
     fontFamily: F.bold,
     color: C.cream,
@@ -576,5 +786,68 @@ const styles = StyleSheet.create({
     fontFamily: F.medium,
     color: C.cyan,
     fontSize: 14,
+  },
+  confirmationOverlay: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  confirmationBackdrop: {
+    ...StyleSheet.absoluteFill,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+  },
+  confirmationCard: {
+    width: '100%',
+    maxWidth: 360,
+    padding: 24,
+    backgroundColor: C.cream,
+    borderWidth: 1,
+    borderColor: C.orange,
+    borderRadius: 20,
+  },
+  confirmationTitle: {
+    fontFamily: F.bold,
+    fontSize: 21,
+    color: C.red,
+  },
+  confirmationMessage: {
+    fontFamily: F.regular,
+    fontSize: 15,
+    color: C.red,
+    marginTop: 10,
+  },
+  confirmationActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 24,
+  },
+  keepButton: {
+    minWidth: 82,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: C.cyan,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+  },
+  keepText: {
+    fontFamily: F.medium,
+    color: C.cyan,
+  },
+  removeButton: {
+    minWidth: 82,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: C.red,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+  },
+  removeText: {
+    fontFamily: F.bold,
+    color: C.cream,
   },
 });
